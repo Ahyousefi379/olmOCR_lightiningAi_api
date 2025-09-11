@@ -1,11 +1,12 @@
 from pdf_references_cleaner import remove_pages_after_references
+from merger_ocrs_util import merge_ocr_texts
 from pathlib import Path
 from olmOCR_api_util import OlmOcrPollingClient
 import os
 
 def main ():
     # directories
-    base_dir = ""
+    base_dir = "H://python_projects//scientific//olmOCR//pdfs"
     raw_pdfs_dir = f"{base_dir}//raw//"     # raw pdfs
     cleaned_pdfs_dir = f"{base_dir}//cleaned//"     # pdfs after removing references
     raw_ocr_dir =  f"{base_dir}//raw ocr//"     # raw text of pdf after OCR
@@ -21,9 +22,9 @@ def main ():
 
 
     # removing reference pages
-    for pdf in raw_pdf_files:
-        remove_pages_after_references(input_pdf_path=f"{raw_pdfs_dir}//{raw_pdf_files}",
-                                        output_pdf_path=f"{cleaned_pdfs_dir}//_cleaned_{raw_pdf_files}")
+    for raw_pdf in raw_pdf_files:
+        remove_pages_after_references(input_pdf_path=f"{raw_pdfs_dir}//{raw_pdf}",
+                                        output_pdf_path=f"{cleaned_pdfs_dir}//_cleaned_{raw_pdf}")
 
 
 
@@ -49,6 +50,16 @@ def main ():
     
 
 
+    # proprocess OCR text
+    #raw_ocr_files = [f for f in os.listdir(raw_ocr_dir) if f.lower().endswith('.md')]
+    
+    # merge two versions
+    #with open(f"{raw_ocr_dir}{raw_ocr_file}_attempt {0}_.md","r","utf8"):
+    #    merge_ocr_texts()
+    
+    # fix heading 
+    #for raw_ocr_file in raw_ocr_files:
 
+        
 if __name__ == "__main__":
     main()
