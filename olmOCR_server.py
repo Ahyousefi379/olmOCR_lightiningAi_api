@@ -1,5 +1,5 @@
 """
-OlmOCR API Server - V9 (Final - Robust File Upload & Polling)
+OlmOCR API Server - V11 (Final - with Empty Output File Check)
 """
 
 import base64
@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, Form
+from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile
 from pydantic import BaseModel, Field
 
 # --- Configure Logging ---
@@ -38,7 +38,7 @@ tasks: Dict[str, Dict[str, Any]] = {}
 def run_ocr_and_update_task(task_id: str, file_content: bytes, filename: str):
     """
     This is the core blocking function that runs in the background.
-    It performs OCR on the provided file content.
+    It performs OCR and updates the shared 'tasks' dictionary with the result.
     """
     start_time = time.time()
     request_id = str(uuid.uuid4())
@@ -60,12 +60,28 @@ def run_ocr_and_update_task(task_id: str, file_content: bytes, filename: str):
             f"--model {shlex.quote(latest_model)}"
         )
         
-        process_timeout = 7000
-        logger.info(f"BACKGROUND_TASK [{task_id}]: Executing command...")
-        process = subprocess.run(command, shell=True, capture_output=True, text=True, check=True, timeout=process_timeout)
-        logger.info(f"BACKGROUND_TASK [{task_id}]: OlmOCR CLI process completed.")
+        logger.info(f"BACKGROUND_TASK [{task_id}]: Executing command: {command}")
 
-        cli_output = process.stdout + "\n" + process.stderr
+        process = subprocess.Popen(
+            command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding='utf-8', bufsize=1
+        )
+
+        output_lines = []
+        if process.stdout:
+            for line in iter(process.stdout.readline, ''):
+                logger.info(f"OlmOCR Subprocess [{task_id}]: {line.strip()}")
+                output_lines.append(line)
+            process.stdout.close()
+
+        return_code = process.wait()
+        
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, command, "".join(output_lines))
+        
+        logger.info(f"BACKGROUND_TASK [{task_id}]: OlmOCR CLI process completed successfully.")
+
+        cli_output = "".join(output_lines)
         stats = {"completed_pages": 0, "failed_pages": 0, "page_failure_rate": "0.00%"}
         completed_match = re.search(r"Completed pages: (\d+)", cli_output)
         if completed_match: stats["completed_pages"] = int(completed_match.group(1))
@@ -80,7 +96,14 @@ def run_ocr_and_update_task(task_id: str, file_content: bytes, filename: str):
         output_files = list(results_dir.glob("output_*.jsonl"))
         if not output_files: raise FileNotFoundError("OlmOCR did not produce an output file.")
         
-        with open(output_files[0], "r", encoding='utf-8') as f: result_data = json.loads(f.readline())
+        # --- NEW: Check for empty file before parsing ---
+        with open(output_files[0], "r", encoding='utf-8') as f:
+            first_line = f.readline()
+            if not first_line or not first_line.strip():
+                raise ValueError("OlmOCR produced an empty or invalid output file, indicating a silent failure on this PDF.")
+            
+            # If the line is not empty, parse it
+            result_data = json.loads(first_line)
         
         tasks[task_id]['status'] = 'complete'
         tasks[task_id]['result'] = {
@@ -99,35 +122,25 @@ def run_ocr_and_update_task(task_id: str, file_content: bytes, filename: str):
         if workspace_dir.exists(): shutil.rmtree(workspace_dir)
         logger.info(f"BACKGROUND_TASK [{task_id}]: Cleaned up directories.")
 
-# --- FastAPI App and Endpoints ---
+# --- FastAPI App and Endpoints (Unchanged) ---
 app = FastAPI()
 
 @app.post("/submit", response_model=SubmitResponse)
 async def submit_ocr_task(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    """
-    Accepts a file upload (`multipart/form-data`), starts the OCR job in the 
-    background, and immediately returns a task ID.
-    """
     task_id = str(uuid.uuid4())
     tasks[task_id] = {"status": "processing", "result": {}}
-    
-    # Read the file content into memory. FastAPI handles large files efficiently.
     file_content = await file.read()
-    
     background_tasks.add_task(run_ocr_and_update_task, task_id, file_content, file.filename)
-    
     logger.info(f"MAIN_THREAD: Task {task_id} submitted for file {file.filename}.")
     return {"task_id": task_id}
 
 @app.get("/status/{task_id}", response_model=StatusResponse)
 async def get_task_status(task_id: str):
-    """Allows the client to poll for the status and result of a task."""
     task = tasks.get(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    
     return task
 
-# --- Main Execution Block ---
+# --- Main Execution Block (Unchanged) ---
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000, timeout_keep_alive=60)

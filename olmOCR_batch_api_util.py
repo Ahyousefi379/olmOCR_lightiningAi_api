@@ -120,7 +120,7 @@ def main():
     SERVER_URL = "https://8000-01k4t3gxyr35s21y2xjhx28e3e.cloudspaces.litng.ai"
     PDF_INPUT_FOLDER = "H://python_projects//scientific//langextract_pdt_data_extraction//data//"
     OUTPUT_FOLDER = "H://python_projects//scientific//langextract_pdt_data_extraction//data//ocr_results//"
-    POLL_INTERVAL_SECONDS = 15
+    POLL_INTERVAL_SECONDS = 30
     TOTAL_WAIT_MINUTES = 30
     # --- END CONFIGURATION ---
 
