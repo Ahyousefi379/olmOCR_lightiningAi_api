@@ -1,0 +1,30 @@
+[
+  {
+    "pdf_name": "_cleaned_2D Zn-Porphyrin-Based Co(II)-MOF with 2-Methylimidazole Sitting Axially on the Paddle–Wheel Units_ An Efficient Electrochemiluminescence Bioassay for SARS-CoV-2.pdf",
+    "is_successful": true,
+    "num_successful_pages": 29,
+    "num_failed_pages": 0,
+    "success_rate": "100.00%",
+    "elapsed_time": 131.065719,
+    "start_time": "2025-09-12 13:42:08.836491",
+    "finish_time": "2025-09-12 13:44:19.902210",
+    "file_size_mb": 2.7533130645751953,
+    "response_size_mb": 0.0,
+    "error_message": null,
+    "attempt_id": "attempt_1"
+  },
+  {
+    "pdf_name": "_cleaned_2D Zn-Porphyrin-Based Co(II)-MOF with 2-Methylimidazole Sitting Axially on the Paddle–Wheel Units_ An Efficient Electrochemiluminescence Bioassay for SARS-CoV-2.pdf",
+    "is_successful": true,
+    "num_successful_pages": 29,
+    "num_failed_pages": 0,
+    "success_rate": "100.00%",
+    "elapsed_time": 120.219699,
+    "start_time": "2025-09-12 13:44:19.909592",
+    "finish_time": "2025-09-12 13:46:20.129291",
+    "file_size_mb": 2.7533130645751953,
+    "response_size_mb": 0.0,
+    "error_message": null,
+    "attempt_id": "attempt_2"
+  }
+]

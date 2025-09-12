@@ -1,1 +1,4 @@
 *.pdf
+*.md
+__pycache__/*
+__pycache__/merger_ocrs_util.cpython-312.pyc
