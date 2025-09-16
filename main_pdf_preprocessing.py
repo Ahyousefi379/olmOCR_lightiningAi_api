@@ -5,7 +5,7 @@ import time
 
 from pdf_references_cleaner import remove_pages_after_references
 from merger_ocrs_util import symmetrical_merge
-from headings_fix_util import process_paper
+from headings_fix_util import ScientificTextToMarkdownConverter
 from olmOCR_api_util import OlmOcrPollingClient
 
 # --- CONFIGURATION ---
@@ -174,9 +174,9 @@ def post_process_ocr(source_dir: Path, target_dir: Path):
     attempt_files: Dict[str, List[Path]] = {}
 
     # Look for files like "basename_attempt_1.md", "basename_attempt_2.md"
-    for md_file in source_dir.glob("*_attempt_*.md"):
+    for md_file in source_dir.glob("*_attempt*.md"):
         # Extract base name (everything before "_attempt_X")
-        parts = md_file.stem.split("_attempt_")
+        parts = md_file.stem.split("_attempt")
         if len(parts) == 2:
             base_name = parts[0]
             attempt_files.setdefault(base_name, []).append(md_file)
@@ -193,7 +193,7 @@ def post_process_ocr(source_dir: Path, target_dir: Path):
             print(f"    - Warning: Expected {NUM_OCR_VERSIONS} attempts, found {len(md_files)}. Using available ones.")
 
         # Sort files by attempt number
-        md_files.sort(key=lambda x: int(x.stem.split("_attempt_")[-1]))
+        md_files.sort(key=lambda x: int((str(x).split("attempt")[-1])[1]))
 
         texts = []
         for md_file in md_files[:NUM_OCR_VERSIONS]:
@@ -217,7 +217,8 @@ def post_process_ocr(source_dir: Path, target_dir: Path):
         print(f"    - Fixing headings and saving into '{output_path.name}'")
         
         try:
-            fixed_heading_text = process_paper(merged_text, metadata_action="keep")
+            convertor = ScientificTextToMarkdownConverter(merged_text)
+            fixed_heading_text = convertor.convert()
 
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write(fixed_heading_text)

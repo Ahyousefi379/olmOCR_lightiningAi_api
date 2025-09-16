@@ -1,144 +1,146 @@
 """
-OlmOCR Client - V9 (Final - Robust File Upload & Polling)
+OlmOCR API Server - V11 (Final - with Empty Output File Check)
 """
+
+import base64
 import json
-import time
-from typing import Dict, Any, Optional
-from pathlib import Path
-import requests
-from dataclasses import dataclass, asdict
-from datetime import datetime
+import logging
 import os
+import re
+import shlex
+import subprocess
+import tempfile
+import time
+import uuid
+from pathlib import Path
+from typing import Dict, Any
 
-# --- Data Classes (Unchanged) ---
-@dataclass
-class ProcessRecord:
-    pdf_name: str; is_successful: bool; num_successful_pages: int; num_failed_pages: int
-    success_rate: str; elapsed_time: float; start_time: str; finish_time: str
-    file_size_mb: float = 0.0; response_size_mb: float = 0.0; error_message: Optional[str] = None
+import uvicorn
+from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile
+from pydantic import BaseModel, Field
 
-class PersistentReporter:
-    def __init__(self, json_filepath: str): self.json_filepath = json_filepath
-    def add_record(self, record: ProcessRecord):
-        data = []
-        if os.path.exists(self.json_filepath):
-            try:
-                with open(self.json_filepath, 'r', encoding='utf-8') as f: data = json.load(f)
-            except (json.JSONDecodeError, FileNotFoundError): pass
-        data.append(asdict(record))
-        with open(self.json_filepath, 'w', encoding='utf-8') as f: json.dump(data, f, indent=2, ensure_ascii=False)
+# --- Configure Logging ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-# --- Main Client Logic ---
-class OlmOcrPollingClient:
-    def __init__(self, base_url: str, json_report_file: str):
-        self.base_url = base_url.rstrip('/')
-        self.submit_url = f"{self.base_url}/submit"
-        self.status_url = f"{self.base_url}/status"
-        self.reporter = PersistentReporter(json_report_file)
-        print(f"Polling Client initialized for: {self.base_url}")
+# --- Pydantic Models ---
+class SubmitResponse(BaseModel):
+    task_id: str = Field(..., description="The unique ID for the processing task.")
 
-    def process_document(self, file_path: str, save_output: bool, output_dir: str, poll_interval_sec: int, total_wait_min: int):
-        filename = Path(file_path).name
-        start_time_obj = datetime.now()
-        print(f"\n{'='*60}\nProcessing: {filename}\n{'='*60}")
+class StatusResponse(BaseModel):
+    status: str = Field(..., description="The current status of the task (processing, complete, or failed).")
+    result: Dict[str, Any] = Field(default_factory=dict, description="The OCR result, only present if status is 'complete'.")
+
+# --- In-Memory Task Storage ---
+tasks: Dict[str, Dict[str, Any]] = {}
+
+# --- OCR Processing Function ---
+def run_ocr_and_update_task(task_id: str, file_content: bytes, filename: str):
+    """
+    This is the core blocking function that runs in the background.
+    It performs OCR and updates the shared 'tasks' dictionary with the result.
+    """
+    start_time = time.time()
+    request_id = str(uuid.uuid4())
+    TEMP_DIR = Path(tempfile.gettempdir()) / "olmocr_processing"
+    input_dir = TEMP_DIR / "inputs" / request_id
+    workspace_dir = TEMP_DIR / "workspaces" / request_id
+    
+    try:
+        input_dir.mkdir(parents=True, exist_ok=True)
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        input_file_path = input_dir / filename
+
+        with open(input_file_path, "wb") as f: f.write(file_content)
         
-        try:
-            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-        except FileNotFoundError:
-            print(f"  ✗ File not found: {file_path}")
-            return
+        latest_model = "allenai/olmOCR-7B-0725-FP8"
+        command = (
+            f"python -m olmocr.pipeline {shlex.quote(str(workspace_dir))} "
+            f"--pdfs {shlex.quote(str(input_file_path))} "
+            f"--model {shlex.quote(latest_model)}"
+        )
+        
+        logger.info(f"BACKGROUND_TASK [{task_id}]: Executing command: {command}")
+
+        process = subprocess.Popen(
+            command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding='utf-8', bufsize=1
+        )
+
+        output_lines = []
+        if process.stdout:
+            for line in iter(process.stdout.readline, ''):
+                logger.info(f"OlmOCR Subprocess [{task_id}]: {line.strip()}")
+                output_lines.append(line)
+            process.stdout.close()
+
+        return_code = process.wait()
+        
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, command, "".join(output_lines))
+        
+        logger.info(f"BACKGROUND_TASK [{task_id}]: OlmOCR CLI process completed successfully.")
+
+        cli_output = "".join(output_lines)
+        stats = {"completed_pages": 0, "failed_pages": 0, "page_failure_rate": "0.00%"}
+        completed_match = re.search(r"Completed pages: (\d+)", cli_output)
+        if completed_match: stats["completed_pages"] = int(completed_match.group(1))
+        failed_match = re.search(r"Failed pages: (\d+)", cli_output)
+        if failed_match: stats["failed_pages"] = int(failed_match.group(1))
+        rate_match = re.search(r"Page Failure rate: ([\d.]+%)", cli_output)
+        if rate_match: stats["page_failure_rate"] = rate_match.group(1)
+        
+        logger.info(f"BACKGROUND_TASK [{task_id}]: Parsed stats: {stats}")
+
+        results_dir = workspace_dir / "results"
+        output_files = list(results_dir.glob("output_*.jsonl"))
+        if not output_files: raise FileNotFoundError("OlmOCR did not produce an output file.")
+        
+        # --- NEW: Check for empty file before parsing ---
+        with open(output_files[0], "r", encoding='utf-8') as f:
+            first_line = f.readline()
+            if not first_line or not first_line.strip():
+                raise ValueError("OlmOCR produced an empty or invalid output file, indicating a silent failure on this PDF.")
             
-        print(f"  File size: {file_size_mb:.2f} MB")
-
-        # --- Stage 1: Submit the job as a file upload ---
-        try:
-            print(f"  Submitting job to server as a file upload...")
-            with open(file_path, 'rb') as f:
-                files = {'file': (filename, f, 'application/pdf')}
-                # The timeout for the upload can be longer to accommodate slow connections
-                submit_response = requests.post(self.submit_url, files=files, timeout=300) 
-            submit_response.raise_for_status()
-            task_id = submit_response.json()["task_id"]
-            print(f"  ✓ Job submitted successfully. Task ID: {task_id}")
-        except requests.RequestException as e:
-            print(f"  ✗ Failed to submit job: {e}")
-            return
-
-        # --- Stage 2: Poll for the result (Unchanged) ---
-        max_polls = (total_wait_min * 60) // poll_interval_sec
-        final_result = None
-        for i in range(max_polls):
-            try:
-                print(f"  Polling for result (attempt {i+1}/{max_polls})...", end='\r')
-                status_response = requests.get(f"{self.status_url}/{task_id}", timeout=30)
-                status_response.raise_for_status()
-                data = status_response.json()
-                
-                if data["status"] == "complete":
-                    print(f"\n  ✓ Task complete!                                ")
-                    final_result = data["result"]
-                    break
-                elif data["status"] == "failed":
-                    print(f"\n  ✗ Task failed on server: {data['result'].get('error', 'Unknown error')}")
-                    final_result = data["result"]
-                    break
-                time.sleep(poll_interval_sec)
-            except requests.RequestException as e:
-                print(f"\n  ✗ Polling request failed: {e}")
-                time.sleep(poll_interval_sec)
+            # If the line is not empty, parse it
+            result_data = json.loads(first_line)
         
-        print() # Newline after polling is done
-        if final_result is None:
-            print(f"  ✗ Job did not complete within the {total_wait_min} minute timeout.")
-            final_result = {"error": f"Client-side timeout after {total_wait_min} minutes."}
+        tasks[task_id]['status'] = 'complete'
+        tasks[task_id]['result'] = {
+            "text": result_data.get("text", ""),
+            "metadata": {"filename": filename, "model_used": latest_model},
+            "processing_time": time.time() - start_time, **stats,
+        }
 
-        # --- Stage 3: Record the outcome (Unchanged) ---
-        finish_time_obj = datetime.now()
-        elapsed_time = (finish_time_obj - start_time_obj).total_seconds()
+    except Exception as e:
+        logger.error(f"BACKGROUND_TASK [{task_id}]: Task failed: {e}")
+        tasks[task_id]['status'] = 'failed'
+        tasks[task_id]['result'] = {'error': str(e)}
+    finally:
+        import shutil
+        if input_dir.exists(): shutil.rmtree(input_dir)
+        if workspace_dir.exists(): shutil.rmtree(workspace_dir)
+        logger.info(f"BACKGROUND_TASK [{task_id}]: Cleaned up directories.")
 
-        if "error" in final_result:
-            record = ProcessRecord(pdf_name=filename, is_successful=False, num_successful_pages=0, num_failed_pages=0,
-                success_rate="0.00%", elapsed_time=elapsed_time, start_time=str(start_time_obj), finish_time=str(finish_time_obj),
-                file_size_mb=file_size_mb, error_message=final_result.get("error"))
-        else:
-            completed, failed = final_result.get('completed_pages', 0), final_result.get('failed_pages', 0)
-            rate = f"{(completed / (completed + failed) * 100):.2f}%" if (completed + failed) > 0 else "N/A"
-            record = ProcessRecord(pdf_name=filename, is_successful=(failed == 0 and completed > 0), num_successful_pages=completed,
-                num_failed_pages=failed, success_rate=rate, elapsed_time=elapsed_time, start_time=str(start_time_obj),
-                finish_time=str(finish_time_obj), file_size_mb=file_size_mb)
-            if save_output and final_result.get('text'):
-                output_path = Path(output_dir) / f"{Path(filename).stem}_extracted.md"
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(output_path, "w", encoding="utf-8") as f: f.write(final_result["text"])
-                print(f"  > Text saved to: {output_path}")
-        
-        self.reporter.add_record(record)
-        print(f"  Total time for {filename}: {elapsed_time:.1f}s. Report updated.")
+# --- FastAPI App and Endpoints (Unchanged) ---
+app = FastAPI()
 
-def main():
-    # --- CONFIGURATION ---
-    SERVER_URL = "https://8000-01k4t3gxyr35s21y2xjhx28e3e.cloudspaces.litng.ai"
-    PDF_INPUT_FOLDER = "H://python_projects//scientific//langextract_pdt_data_extraction//data//"
-    OUTPUT_FOLDER = "H://python_projects//scientific//langextract_pdt_data_extraction//data//ocr_results//"
-    POLL_INTERVAL_SECONDS = 30
-    TOTAL_WAIT_MINUTES = 30
-    # --- END CONFIGURATION ---
+@app.post("/submit", response_model=SubmitResponse)
+async def submit_ocr_task(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    task_id = str(uuid.uuid4())
+    tasks[task_id] = {"status": "processing", "result": {}}
+    file_content = await file.read()
+    background_tasks.add_task(run_ocr_and_update_task, task_id, file_content, file.filename)
+    logger.info(f"MAIN_THREAD: Task {task_id} submitted for file {file.filename}.")
+    return {"task_id": task_id}
 
-    Path(PDF_INPUT_FOLDER).mkdir(exist_ok=True)
-    Path(OUTPUT_FOLDER).mkdir(exist_ok=True)
-    
-    client = OlmOcrPollingClient(base_url=SERVER_URL, json_report_file=os.path.join(OUTPUT_FOLDER, "ocr_report.json"))
-    
-    pdf_files = [f for f in os.listdir(PDF_INPUT_FOLDER) if f.lower().endswith('.pdf')]
-    if not pdf_files:
-        print(f"No PDF files found in '{PDF_INPUT_FOLDER}'. Please add some PDFs to test.")
-        return
+@app.get("/status/{task_id}", response_model=StatusResponse)
+async def get_task_status(task_id: str):
+    task = tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
 
-    for pdf_filename in pdf_files:
-        client.process_document(file_path=os.path.join(PDF_INPUT_FOLDER, pdf_filename), save_output=True,
-            output_dir=OUTPUT_FOLDER, poll_interval_sec=POLL_INTERVAL_SECONDS, total_wait_min=TOTAL_WAIT_MINUTES)
-
-    print(f"\nProcessing complete! Check '{os.path.join(OUTPUT_FOLDER, 'ocr_report.json')}' for reports.")
-
+# --- Main Execution Block (Unchanged) ---
 if __name__ == "__main__":
-    main()
+    uvicorn.run(app, host="0.0.0.0", port=8000, timeout_keep_alive=60)
