@@ -3,11 +3,14 @@ from pathlib import Path
 from typing import List, Dict
 import time
 
+from openpyxl import Workbook, load_workbook
+
 from pdf_references_cleaner import remove_pages_after_references
 from merger_ocrs_util import symmetrical_merge
 from validate_pdf import validate_pdfs
 from headings_fix_util import ScientificTextToMarkdownConverter
 from olmOCR_api_util import OlmOcrPollingClient
+
 
 
 # --- CONFIGURATION ---
@@ -19,7 +22,7 @@ MD_DIR = BASE_DIR / "md"
 
 SERVER_URL = "https://8000-01k4ymt1036tngva09ywdk72z6.cloudspaces.litng.ai"
 POLL_INTERVAL_SECONDS = 10
-TOTAL_WAIT_MINUTES = 12
+TOTAL_WAIT_MINUTES = 15
 NUM_OCR_VERSIONS = 1
 MAX_RETRY_ATTEMPTS = 2
 
@@ -65,7 +68,7 @@ def get_base_name_from_cleaned(pdf_path: Path) -> str:
     return pdf_path.stem.replace('_cleaned_', '')
 
 
-def perform_ocr_with_validation(source_files: List[Path], target_dir: Path):
+def perform_ocr_with_validation(source_files: List[Path], target_dir: Path, save_reports_dir:Path):
     print("Starting OCR process...")
     if not source_files:
         print("No valid cleaned PDFs to process.")
@@ -73,11 +76,21 @@ def perform_ocr_with_validation(source_files: List[Path], target_dir: Path):
 
     client = OlmOcrPollingClient(
         base_url=SERVER_URL,
-        json_report_file=str(target_dir / "ocr_report.json")
+        json_report_file=str(save_reports_dir / "ocr_report.json")
     )
 
     successful_pdfs = []
-    failed_pdfs = []
+
+    # Excel path to record failed PDFs
+    excel_path = save_reports_dir / "failed_ocr_pdfs.xlsx"
+    
+    # Initialize Excel if it doesn't exist
+    if not excel_path.exists():
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Failed OCR PDFs"
+        ws.append(["Filename", "Reason"])
+        wb.save(str(excel_path))
 
     for pdf_path in source_files:
         base_name = get_base_name_from_cleaned(pdf_path)
@@ -89,6 +102,7 @@ def perform_ocr_with_validation(source_files: List[Path], target_dir: Path):
         print(f"    - Found {existing_successes} existing successful attempts")
 
         successful_versions = existing_successes
+        failed_reason = ""
 
         for version in range(existing_successes + 1, NUM_OCR_VERSIONS + 1):
             output_path = target_dir / f"{base_name}_attempt_{version}.md"
@@ -117,10 +131,12 @@ def perform_ocr_with_validation(source_files: List[Path], target_dir: Path):
                         successful_versions += 1
                         break
                     else:
+                        failed_reason = "No valid OCR output"
                         print(f"      - Version {version} failed (no valid output)")
 
                 except Exception as e:
-                    print(f"      - Version {version} failed with error: {str(e)}")
+                    failed_reason = str(e)
+                    print(f"      - Version {version} failed with error: {failed_reason}")
 
                 if attempt < MAX_RETRY_ATTEMPTS:
                     print(f"      - Retrying version {version} in 10 seconds...")
@@ -134,15 +150,23 @@ def perform_ocr_with_validation(source_files: List[Path], target_dir: Path):
             successful_pdfs.append(cleaned_filename)
         else:
             print(f"  ✗ '{cleaned_filename}' failed - only {successful_versions}/{NUM_OCR_VERSIONS} versions succeeded")
-            failed_pdfs.append(cleaned_filename)
+            
+            # --- Record failed PDF in Excel immediately ---
+            try:
+                wb = load_workbook(str(excel_path))
+                ws = wb.active
+                ws.append([cleaned_filename, failed_reason])
+                wb.save(str(excel_path))
+                print(f"    - Recorded failed PDF in Excel: {excel_path.name}")
+            except Exception as e:
+                print(f"    - Could not write failed PDF to Excel: {e}")
 
     print(f"\nOCR processing complete!")
     print(f"Successful PDFs: {len(successful_pdfs)}")
-    print(f"Failed PDFs: {len(failed_pdfs)}")
-    if failed_pdfs:
-        print("Failed PDFs:")
-        for pdf_name in failed_pdfs:
-            print(f"  - {pdf_name}")
+    
+    # Optionally, print a summary of failed PDFs from Excel
+    if excel_path.exists():
+        print(f"Failed PDFs recorded in Excel: {excel_path}")
     print()
 
 
@@ -201,13 +225,17 @@ def main():
     setup_directories()
 
     # Step 1: Remove reference pages
-    clean_pdfs(source_dir=RAW_PDFS_DIR, target_dir=CLEANED_PDFS_DIR)
+    clean_pdfs(source_dir=RAW_PDFS_DIR,
+               target_dir=CLEANED_PDFS_DIR)
 
     # Step 2: Validate PDFs
-    valid_pdfs = validate_pdfs(source_dir=CLEANED_PDFS_DIR,save_excel_dir=BASE_DIR)
+    valid_pdfs = validate_pdfs(source_dir=CLEANED_PDFS_DIR,
+                               save_report_dir=BASE_DIR)
 
     # Step 3: Run OCR only on valid PDFs
-    perform_ocr_with_validation(source_files=valid_pdfs, target_dir=RAW_OCR_DIR)
+    perform_ocr_with_validation(source_files=valid_pdfs,
+                                target_dir=RAW_OCR_DIR,
+                                save_reports_dir=BASE_DIR)
 
     # Step 4: Merge OCR results
     #post_process_ocr(source_dir=RAW_OCR_DIR, target_dir=MD_DIR)

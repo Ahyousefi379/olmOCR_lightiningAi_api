@@ -1,10 +1,10 @@
 from PyPDF2 import PdfReader  
 from pathlib import Path
-from typing import List, Dict, Tuple
-from openpyxl import Workbook  # <-- add this import
+from typing import List, Tuple
+from openpyxl import Workbook  
 
 
-def validate_pdfs(source_dir: Path, save_excel_dir: Path) -> Tuple[List[Path], List[Path]]:
+def validate_pdfs(source_dir: Path, save_report_dir: Path) -> Tuple[List[Path], List[Path]]:
     """
     Validate all PDFs in the given directory.
     Return (valid_pdfs, invalid_pdfs).
@@ -32,7 +32,7 @@ def validate_pdfs(source_dir: Path, save_excel_dir: Path) -> Tuple[List[Path], L
 
     # --- Save invalid PDFs to Excel ---
     if invalid_pdfs:
-        excel_path = save_excel_dir / "invalid_pdfs.xlsx"
+        excel_path = save_report_dir / "invalid_pdfs.xlsx"
         wb = Workbook()
         ws = wb.active
         ws.title = "Invalid PDFs"
