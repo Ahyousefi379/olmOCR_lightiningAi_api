@@ -21,8 +21,8 @@ MD_DIR = BASE_DIR / "md"
 SERVER_URL = "https://8000-01k4ymt1036tngva09ywdk72z6.cloudspaces.litng.ai"
 POLL_INTERVAL_SECONDS = 10
 TOTAL_WAIT_MINUTES = 12
-NUM_OCR_VERSIONS = 2
-MAX_RETRY_ATTEMPTS = 3  # Maximum attempts per OCR version if it fails
+NUM_OCR_VERSIONS = 1
+MAX_RETRY_ATTEMPTS = 2  # Maximum attempts per OCR version if it fails
 
 
 def setup_directories():
@@ -235,13 +235,13 @@ def main():
     # --- Uncomment the steps you want to run ---
     
     # Step 1: Remove reference pages from raw PDFs
-    # clean_pdfs(source_dir=RAW_PDFS_DIR, target_dir=CLEANED_PDFS_DIR)
+    clean_pdfs(source_dir=RAW_PDFS_DIR, target_dir=CLEANED_PDFS_DIR)
     
     # Step 2: Run OCR on the cleaned PDFs with validation
-    #perform_ocr_with_validation(source_dir=CLEANED_PDFS_DIR, target_dir=RAW_OCR_DIR)
+    perform_ocr_with_validation(source_dir=CLEANED_PDFS_DIR, target_dir=RAW_OCR_DIR)
 
     # Step 3: Merge OCR attempts and finalize the text
-    post_process_ocr(source_dir=RAW_OCR_DIR, target_dir=MD_DIR)
+    #post_process_ocr(source_dir=RAW_OCR_DIR, target_dir=MD_DIR)
     
     print("Pipeline finished.")
 

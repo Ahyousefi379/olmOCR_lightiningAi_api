@@ -1,23 +1,34 @@
 """
-OlmOCR API Server - V11 (Final - with Empty Output File Check)
+OlmOCR API Server - Optimized Version with Persistent Model (Backwards-Compatible Output)
 """
 
-import base64
+import asyncio
 import json
 import logging
 import os
-import re
-import shlex
+import shutil
 import subprocess
 import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile
 from pydantic import BaseModel, Field
+from huggingface_hub import snapshot_download
+from pypdf import PdfReader
+
+# Import OlmOCR modules
+from olmocr.data.renderpdf import render_pdf_to_base64png
+from olmocr.prompts.prompts import PageResponse, build_no_anchoring_yaml_prompt
+from olmocr.prompts.anchor import get_anchor_text
+from olmocr.train.dataloader import FrontMatterParser
+from olmocr.image_utils import convert_image_to_pdf_bytes, is_jpeg, is_png
+from olmocr.version import VERSION
 
 # --- Configure Logging ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -31,116 +42,242 @@ class StatusResponse(BaseModel):
     status: str = Field(..., description="The current status of the task (processing, complete, or failed).")
     result: Dict[str, Any] = Field(default_factory=dict, description="The OCR result, only present if status is 'complete'.")
 
-# --- In-Memory Task Storage ---
+# --- Configuration ---
+@dataclass
+class OlmOCRConfig:
+    model: str = "allenai/olmOCR-7B-0825-FP8"
+    vllm_port: int = 30024
+    max_page_retries: int = 8
+    target_longest_image_dim: int = 1288
+    max_page_error_rate: float = 0.004
+    gpu_memory_utilization: float = 0.95
+    max_model_len: int = 16384
+    tensor_parallel_size: int = 1
+
+# --- Global Variables ---
 tasks: Dict[str, Dict[str, Any]] = {}
+config = OlmOCRConfig()
+vllm_process: Optional[subprocess.Popen] = None
+vllm_ready = False
 
-# --- OCR Processing Function ---
-def run_ocr_and_update_task(task_id: str, file_content: bytes, filename: str):
-    """
-    This is the core blocking function that runs in the background.
-    It performs OCR and updates the shared 'tasks' dictionary with the result.
-    """
-    start_time = time.time()
-    request_id = str(uuid.uuid4())
-    TEMP_DIR = Path(tempfile.gettempdir()) / "olmocr_processing"
-    input_dir = TEMP_DIR / "inputs" / request_id
-    workspace_dir = TEMP_DIR / "workspaces" / request_id
-    
+# --- VLLM Server Management ---
+async def start_vllm_server():
+    global vllm_process, vllm_ready
+    model_path = config.model
+    if not os.path.exists(model_path) and not model_path.startswith("allenai/"):
+        logger.info(f"Model not found locally, attempting to download: {model_path}")
+        try:
+            model_path = snapshot_download(repo_id=config.model)
+        except Exception as e:
+            logger.error(f"Failed to download model: {e}")
+            raise
+
+    cmd = [
+        "python", "-m", "vllm.entrypoints.openai.api_server",
+        "--model", model_path,
+        "--port", str(config.vllm_port),
+        "--disable-log-requests",
+        "--served-model-name", "olmocr",
+        "--tensor-parallel-size", str(config.tensor_parallel_size),
+        "--gpu-memory-utilization", str(config.gpu_memory_utilization),
+        "--max-model-len", str(config.max_model_len),
+    ]
+
+    logger.info(f"Starting vLLM server with command: {' '.join(cmd)}")
+    vllm_process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={**os.environ, "OMP_NUM_THREADS": "1"}
+    )
+
+    await wait_for_vllm_ready()
+    vllm_ready = True
+    logger.info("vLLM server is ready")
+
+async def wait_for_vllm_ready():
+    import httpx
+    url = f"http://localhost:{config.vllm_port}/v1/models"
+    for _ in range(60):
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, timeout=5.0)
+                if response.status_code == 200:
+                    return
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+    raise RuntimeError("vLLM server failed to start within timeout")
+
+async def stop_vllm_server():
+    global vllm_process, vllm_ready
+    if vllm_process:
+        logger.info("Stopping vLLM server...")
+        vllm_process.terminate()
+        try:
+            vllm_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            vllm_process.kill()
+        vllm_process = None
+        vllm_ready = False
+
+# --- OCR Processing ---
+async def process_page(pdf_path: str, page_num: int) -> Dict[str, Any]:
+    import httpx, base64
+    from io import BytesIO
+    from PIL import Image
+
+    MAX_TOKENS = 4500
+    TEMPERATURES = [0.1,0.1,0.2,0.3,0.5,0.8,0.9,1.0]
+    attempt, cumulative_rotation = 0, 0
+
+    while attempt < config.max_page_retries:
+        try:
+            image_base64 = await asyncio.to_thread(
+                render_pdf_to_base64png, pdf_path, page_num,
+                target_longest_image_dim=config.target_longest_image_dim
+            )
+
+            if cumulative_rotation:
+                image_bytes = base64.b64decode(image_base64)
+                with Image.open(BytesIO(image_bytes)) as img:
+                    transpose = {
+                        90: Image.Transpose.ROTATE_90,
+                        180: Image.Transpose.ROTATE_180,
+                        270: Image.Transpose.ROTATE_270
+                    }[cumulative_rotation]
+                    img = img.transpose(transpose)
+                    buf = BytesIO()
+                    img.save(buf, format="PNG")
+                    image_base64 = base64.b64encode(buf.getvalue()).decode()
+
+            query = {
+                "model": "olmocr",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": build_no_anchoring_yaml_prompt()},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}}
+                    ]
+                }],
+                "max_tokens": MAX_TOKENS,
+                "temperature": TEMPERATURES[min(attempt, len(TEMPERATURES)-1)]
+            }
+
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                r = await client.post(f"http://localhost:{config.vllm_port}/v1/chat/completions", json=query)
+            if r.status_code != 200:
+                raise ValueError(f"vLLM status {r.status_code}: {r.text}")
+            data = r.json()
+
+            model_response = data["choices"][0]["message"]["content"]
+            parser = FrontMatterParser(front_matter_class=PageResponse)
+            fm, text = parser._extract_front_matter_and_text(model_response)
+            pr = parser._parse_front_matter(fm, text)
+
+            if not pr.is_rotation_valid and attempt < config.max_page_retries-1:
+                cumulative_rotation = (cumulative_rotation + pr.rotation_correction) % 360
+                attempt += 1
+                continue
+
+            return {
+                "text": pr.natural_text,
+                "tokens": {
+                    "input": data["usage"].get("prompt_tokens", 0),
+                    "output": data["usage"].get("completion_tokens", 0)
+                },
+                "success": True
+            }
+        except Exception as e:
+            logger.warning(f"Page {page_num} attempt {attempt+1} failed: {e}")
+            attempt += 1
+            await asyncio.sleep(min(2**attempt, 10))
+
     try:
-        input_dir.mkdir(parents=True, exist_ok=True)
-        workspace_dir.mkdir(parents=True, exist_ok=True)
-        input_file_path = input_dir / filename
+        fb_text = get_anchor_text(pdf_path, page_num, pdf_engine="pdftotext")
+    except:
+        fb_text = ""
+    return {"text": fb_text, "tokens": {"input":0,"output":0}, "success": False}
 
-        with open(input_file_path, "wb") as f: f.write(file_content)
-        
-        latest_model = "allenai/olmOCR-7B-0725-FP8"
-        command = (
-            f"python -m olmocr.pipeline {shlex.quote(str(workspace_dir))} "
-            f"--pdfs {shlex.quote(str(input_file_path))} "
-            f"--model {shlex.quote(latest_model)}"
-        )
-        
-        logger.info(f"BACKGROUND_TASK [{task_id}]: Executing command: {command}")
+async def process_pdf(pdf_path: str, filename: str) -> Dict[str, Any]:
+    reader = PdfReader(pdf_path)
+    num_pages = len(reader.pages)
 
-        process = subprocess.Popen(
-            command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding='utf-8', bufsize=1
-        )
+    sem = asyncio.Semaphore(5)
+    async def worker(i): 
+        async with sem: return await process_page(pdf_path, i)
 
-        output_lines = []
-        if process.stdout:
-            for line in iter(process.stdout.readline, ''):
-                logger.info(f"OlmOCR Subprocess [{task_id}]: {line.strip()}")
-                output_lines.append(line)
-            process.stdout.close()
+    results = await asyncio.gather(*[worker(i) for i in range(1,num_pages+1)])
+    text = "\n".join(r["text"] for r in results if r.get("text"))
+    total_in = sum(r["tokens"]["input"] for r in results)
+    total_out = sum(r["tokens"]["output"] for r in results)
+    failed = sum(1 for r in results if not r["success"])
 
-        return_code = process.wait()
-        
-        if return_code != 0:
-            raise subprocess.CalledProcessError(return_code, command, "".join(output_lines))
-        
-        logger.info(f"BACKGROUND_TASK [{task_id}]: OlmOCR CLI process completed successfully.")
+    error_rate = failed/num_pages if num_pages else 0
+    if error_rate > config.max_page_error_rate:
+        raise ValueError(f"Too many failed pages: {failed}/{num_pages}")
 
-        cli_output = "".join(output_lines)
-        stats = {"completed_pages": 0, "failed_pages": 0, "page_failure_rate": "0.00%"}
-        completed_match = re.search(r"Completed pages: (\d+)", cli_output)
-        if completed_match: stats["completed_pages"] = int(completed_match.group(1))
-        failed_match = re.search(r"Failed pages: (\d+)", cli_output)
-        if failed_match: stats["failed_pages"] = int(failed_match.group(1))
-        rate_match = re.search(r"Page Failure rate: ([\d.]+%)", cli_output)
-        if rate_match: stats["page_failure_rate"] = rate_match.group(1)
-        
-        logger.info(f"BACKGROUND_TASK [{task_id}]: Parsed stats: {stats}")
+    return {
+        "text": text,
+        "metadata": {"filename": filename, "model_used": config.model},
+        "completed_pages": num_pages - failed,
+        "failed_pages": failed,
+        "page_failure_rate": f"{(failed/num_pages*100):.2f}%" if num_pages else "0.00%",
+        "total_input_tokens": total_in,
+        "total_output_tokens": total_out,
+    }
 
-        results_dir = workspace_dir / "results"
-        output_files = list(results_dir.glob("output_*.jsonl"))
-        if not output_files: raise FileNotFoundError("OlmOCR did not produce an output file.")
-        
-        # --- NEW: Check for empty file before parsing ---
-        with open(output_files[0], "r", encoding='utf-8') as f:
-            first_line = f.readline()
-            if not first_line or not first_line.strip():
-                raise ValueError("OlmOCR produced an empty or invalid output file, indicating a silent failure on this PDF.")
-            
-            # If the line is not empty, parse it
-            result_data = json.loads(first_line)
-        
-        tasks[task_id]['status'] = 'complete'
-        tasks[task_id]['result'] = {
-            "text": result_data.get("text", ""),
-            "metadata": {"filename": filename, "model_used": latest_model},
-            "processing_time": time.time() - start_time, **stats,
-        }
+# --- Background Task ---
+async def run_ocr_task(task_id: str, file_content: bytes, filename: str):
+    start = time.time()
+    while not vllm_ready: await asyncio.sleep(1)
 
-    except Exception as e:
-        logger.error(f"BACKGROUND_TASK [{task_id}]: Task failed: {e}")
-        tasks[task_id]['status'] = 'failed'
-        tasks[task_id]['result'] = {'error': str(e)}
-    finally:
-        import shutil
-        if input_dir.exists(): shutil.rmtree(input_dir)
-        if workspace_dir.exists(): shutil.rmtree(workspace_dir)
-        logger.info(f"BACKGROUND_TASK [{task_id}]: Cleaned up directories.")
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        try:
+            tmp.write(file_content); tmp.flush()
+            if is_png(tmp.name) or is_jpeg(tmp.name):
+                pdf_bytes = convert_image_to_pdf_bytes(tmp.name)
+                tmp.write(pdf_bytes); tmp.flush()
 
-# --- FastAPI App and Endpoints (Unchanged) ---
-app = FastAPI()
+            result = await process_pdf(tmp.name, filename)
+            result["processing_time"] = time.time() - start
+            tasks[task_id]["status"] = "complete"
+            tasks[task_id]["result"] = result
+        except Exception as e:
+            tasks[task_id]["status"] = "failed"
+            tasks[task_id]["result"] = {"error": str(e)}
+        finally:
+            if os.path.exists(tmp.name): os.unlink(tmp.name)
+
+# --- FastAPI App ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting OlmOCR API Server...")
+    await start_vllm_server()
+    yield
+    logger.info("Shutting down OlmOCR API Server...")
+    await stop_vllm_server()
+
+app = FastAPI(lifespan=lifespan)
 
 @app.post("/submit", response_model=SubmitResponse)
 async def submit_ocr_task(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     task_id = str(uuid.uuid4())
     tasks[task_id] = {"status": "processing", "result": {}}
-    file_content = await file.read()
-    background_tasks.add_task(run_ocr_and_update_task, task_id, file_content, file.filename)
-    logger.info(f"MAIN_THREAD: Task {task_id} submitted for file {file.filename}.")
+    content = await file.read()
+    background_tasks.add_task(run_ocr_task, task_id, content, file.filename)
     return {"task_id": task_id}
 
 @app.get("/status/{task_id}", response_model=StatusResponse)
 async def get_task_status(task_id: str):
     task = tasks.get(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+    if not task: raise HTTPException(status_code=404, detail="Task not found")
     return task
 
-# --- Main Execution Block (Unchanged) ---
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy" if vllm_ready else "starting"}
+
+# --- Main ---
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000, timeout_keep_alive=60)
