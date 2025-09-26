@@ -204,7 +204,7 @@ def main():
     clean_pdfs(source_dir=RAW_PDFS_DIR, target_dir=CLEANED_PDFS_DIR)
 
     # Step 2: Validate PDFs
-    valid_pdfs, invalid_pdfs = validate_pdfs(source_dir=CLEANED_PDFS_DIR,save_excel_dir=BASE_DIR)
+    valid_pdfs = validate_pdfs(source_dir=CLEANED_PDFS_DIR,save_excel_dir=BASE_DIR)
 
     # Step 3: Run OCR only on valid PDFs
     perform_ocr_with_validation(source_files=valid_pdfs, target_dir=RAW_OCR_DIR)
