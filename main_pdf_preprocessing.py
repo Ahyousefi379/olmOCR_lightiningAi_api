@@ -20,11 +20,14 @@ CLEANED_PDFS_DIR = BASE_DIR / "cleaned"
 RAW_OCR_DIR = BASE_DIR / "raw ocr"
 MD_DIR = BASE_DIR / "md"
 
-SERVER_URL = "https://8000-01k4ymt1036tngva09ywdk72z6.cloudspaces.litng.ai"
+#SERVER_URL = "https://8000-01k4ymt1036tngva09ywdk72z6.cloudspaces.litng.ai"  #account = ahyousefi379+1
+
+SERVER_URL = "https://8000-01k63fzfe4jzfjv93prex1pk7v.cloudspaces.litng.ai"  #account = ahyousefi379+1
+
 POLL_INTERVAL_SECONDS = 10
-TOTAL_WAIT_MINUTES = 15
+TOTAL_WAIT_MINUTES = 5
 NUM_OCR_VERSIONS = 1
-MAX_RETRY_ATTEMPTS = 2
+MAX_RETRY_ATTEMPTS = 1
 
 
 def setup_directories():
@@ -225,8 +228,8 @@ def main():
     setup_directories()
 
     # Step 1: Remove reference pages
-    clean_pdfs(source_dir=RAW_PDFS_DIR,
-               target_dir=CLEANED_PDFS_DIR)
+    #clean_pdfs(source_dir=RAW_PDFS_DIR,
+    #           target_dir=CLEANED_PDFS_DIR)
 
     # Step 2: Validate PDFs
     valid_pdfs = validate_pdfs(source_dir=CLEANED_PDFS_DIR,
