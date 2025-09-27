@@ -22,7 +22,9 @@ MD_DIR = BASE_DIR / "md"
 
 #SERVER_URL = "https://8000-01k4ymt1036tngva09ywdk72z6.cloudspaces.litng.ai"  #account = ahyousefi379+1
 
-SERVER_URL = "https://8000-01k63fzfe4jzfjv93prex1pk7v.cloudspaces.litng.ai"  #account = ahyousefi379+1
+#SERVER_URL = "https://8000-01k63fzfe4jzfjv93prex1pk7v.cloudspaces.litng.ai"  #account = ahyousefi379+1
+
+SERVER_URL= "https://8000-01k6516jt155gsnbey7qymq56x.cloudspaces.litng.ai"  #ahyousefi379channel
 
 POLL_INTERVAL_SECONDS = 10
 TOTAL_WAIT_MINUTES = 5
