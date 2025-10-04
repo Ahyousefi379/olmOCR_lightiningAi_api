@@ -15,6 +15,10 @@ python-magic>=0.4.27
 chardet>=5.0.0
 
 
+https://download.pytorch.org/whl/cu128/flashinfer/flashinfer_python-0.2.5%2Bcu128torch2.7-cp38-abi3-linux_x86_64.whl
+
+numpy scikit-learn transformers torch --no-cache-dir
+
 
 # Optional: If you need additional PDF libraries
 # pypdf>=3.0.0

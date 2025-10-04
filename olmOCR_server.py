@@ -1,5 +1,6 @@
 """
-OlmOCR API Server - Improved Version with Auto-Restart Watchdog
+OlmOCR API Server - Improved Version with Auto-Restart and Watchdog
+Drop-in replacement: save as server_auto_restart.py
 """
 
 import asyncio
@@ -11,6 +12,8 @@ import subprocess
 import tempfile
 import time
 import uuid
+import signal
+import sys
 from pathlib import Path
 from typing import Dict, Any, Optional
 from contextlib import asynccontextmanager
@@ -22,7 +25,7 @@ from pydantic import BaseModel, Field
 from huggingface_hub import snapshot_download
 from pypdf import PdfReader
 
-# Import OlmOCR modules
+# Import OlmOCR modules (keep these as in your original environment)
 from olmocr.data.renderpdf import render_pdf_to_base64png
 from olmocr.prompts.prompts import PageResponse, build_no_anchoring_yaml_prompt
 from olmocr.prompts.anchor import get_anchor_text
@@ -53,22 +56,31 @@ class OlmOCRConfig:
     gpu_memory_utilization: float = 0.95
     max_model_len: int = 16384
     tensor_parallel_size: int = 1
-    startup_timeout: int = 600  # 10 minutes for model download + startup
+    startup_timeout: int = 600  # seconds
     health_check_interval: int = 5  # seconds
-    task_timeout: int = 240  # 4 minutes per PDF processing task
+    task_timeout: int = 240  # seconds per PDF processing task
+
+    # Auto-restart & watchdog
+    auto_restart_interval: int = 30 * 60  # seconds (30 minutes). Change this to e.g. 3600 for 1 hour
+    watchdog_check_interval: int = 30  # seconds between watchdog checks
+    watchdog_failure_threshold: int = 3  # consecutive failures to trigger restart
 
 # --- Global Variables ---
 tasks: Dict[str, Dict[str, Any]] = {}
 config = OlmOCRConfig()
 vllm_process: Optional[subprocess.Popen] = None
 vllm_ready = False
-last_activity = time.time()  # Track last task completion
+_vllm_monitor_task: Optional[asyncio.Task] = None
 
 # --- VLLM Server Management ---
 async def download_model_if_needed():
     """Download model if it doesn't exist locally"""
     model_path = config.model
-    if not os.path.exists(model_path) and not model_path.startswith("allenai/"):
+    if not os.path.exists(model_path) and model_path.startswith("allenai/"):
+        # For HuggingFace hub names (like allenai/...), snapshot_download will be used
+        logger.info(f"Model appears to be HF remote identifier: {model_path}. Will rely on vLLM remote loading.")
+        return model_path
+    if not os.path.exists(model_path):
         logger.info(f"Model not found locally, attempting to download: {model_path}")
         try:
             model_path = snapshot_download(repo_id=config.model)
@@ -80,12 +92,18 @@ async def download_model_if_needed():
     return model_path
 
 async def start_vllm_server():
-    global vllm_process, vllm_ready
-    
+    global vllm_process, vllm_ready, _vllm_monitor_task
+
+    # Prevent double starts
+    if vllm_process and vllm_process.poll() is None:
+        logger.info("vLLM process already running, start_vllm_server skipping.")
+        vllm_ready = True
+        return
+
     model_path = await download_model_if_needed()
 
     cmd = [
-        "python", "-m", "vllm.entrypoints.openai.api_server",
+        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
         "--model", model_path,
         "--port", str(config.vllm_port),
         "--disable-log-requests",
@@ -96,91 +114,119 @@ async def start_vllm_server():
     ]
 
     logger.info(f"Starting vLLM server with command: {' '.join(cmd)}")
-    
+
     vllm_process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env={**os.environ, "OMP_NUM_THREADS": "1"}
     )
-    
-    asyncio.create_task(monitor_vllm_process())
-    await wait_for_vllm_ready()
+
+    # start monitor task
+    _vllm_monitor_task = asyncio.create_task(monitor_vllm_process())
+
+    # Wait for server to be ready
+    try:
+        await wait_for_vllm_ready()
+    except Exception:
+        # If it failed to become ready, stop process to clean up
+        await stop_vllm_server()
+        raise
+
     vllm_ready = True
     logger.info("vLLM server is ready")
 
 async def monitor_vllm_process():
+    """Monitor vLLM process output for debugging"""
+    global vllm_process
     if not vllm_process:
         return
+
     try:
-        while vllm_process.poll() is None:
+        while vllm_process and vllm_process.poll() is None:
+            # non-blocking reads of stderr and stdout via thread
             if vllm_process.stderr:
                 line = await asyncio.to_thread(vllm_process.stderr.readline)
                 if line:
-                    logger.info(f"vLLM: {line.decode().strip()}")
-            await asyncio.sleep(1)
+                    try:
+                        logger.info(f"vLLM STDERR: {line.decode().rstrip()}")
+                    except Exception:
+                        logger.info(f"vLLM STDERR (raw): {line}")
+            if vllm_process.stdout:
+                line_out = await asyncio.to_thread(vllm_process.stdout.readline)
+                if line_out:
+                    try:
+                        logger.debug(f"vLLM STDOUT: {line_out.decode().rstrip()}")
+                    except Exception:
+                        logger.debug("vLLM STDOUT (raw)")
+            await asyncio.sleep(0.1)
+    except asyncio.CancelledError:
+        logger.info("monitor_vllm_process cancelled")
     except Exception as e:
-        logger.error(f"Error monitoring vLLM process: {e}")
+        logger.exception(f"Error monitoring vLLM process: {e}")
 
 async def wait_for_vllm_ready():
+    """Wait for vLLM server to be ready with better error reporting"""
     import httpx
     url = f"http://localhost:{config.vllm_port}/v1/models"
+
     start_time = time.time()
-    max_iterations = config.startup_timeout // config.health_check_interval
-    
+    max_iterations = max(1, int(config.startup_timeout // max(1, config.health_check_interval)))
+
     for i in range(max_iterations):
+        # If process died, capture output and raise
         if vllm_process and vllm_process.poll() is not None:
             stdout, stderr = vllm_process.communicate()
-            logger.error("vLLM process terminated unexpectedly:")
+            logger.error("vLLM process terminated before becoming ready")
             logger.error(f"STDOUT: {stdout.decode() if stdout else 'None'}")
             logger.error(f"STDERR: {stderr.decode() if stderr else 'None'}")
             raise RuntimeError("vLLM process terminated unexpectedly")
-        
+
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.get(url, timeout=10.0)
+                response = await client.get(url, timeout=5.0)
                 if response.status_code == 200:
                     logger.info(f"vLLM server ready after {time.time() - start_time:.1f}s")
                     return
+                else:
+                    logger.info(f"vLLM responded {response.status_code} while waiting for readiness")
         except httpx.ConnectError:
             if i % 10 == 0:
-                logger.info(f"Still waiting for vLLM server... ({time.time() - start_time:.1f}s elapsed)")
+                elapsed = time.time() - start_time
+                logger.info(f"Still waiting for vLLM server... ({elapsed:.1f}s elapsed)")
         except Exception as e:
-            logger.warning(f"Error checking vLLM status: {e}")
-        
+            logger.debug(f"Error while waiting for vLLM ready: {e}")
         await asyncio.sleep(config.health_check_interval)
-    
-    raise RuntimeError("vLLM server failed to start in time")
+
+    raise RuntimeError(f"vLLM server failed to start within {config.startup_timeout}s timeout")
 
 async def stop_vllm_server():
-    global vllm_process, vllm_ready
+    global vllm_process, vllm_ready, _vllm_monitor_task
     if vllm_process:
         logger.info("Stopping vLLM server...")
-        vllm_process.terminate()
         try:
-            vllm_process.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            logger.warning("vLLM server didn't terminate gracefully, killing...")
-            vllm_process.kill()
-        vllm_process = None
-        vllm_ready = False
+            vllm_process.terminate()
+            try:
+                vllm_process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                logger.warning("vLLM server didn't terminate gracefully, killing...")
+                vllm_process.kill()
+        except Exception as e:
+            logger.exception(f"Error when stopping vllm process: {e}")
+        finally:
+            vllm_process = None
+            vllm_ready = False
+            if _vllm_monitor_task:
+                _vllm_monitor_task.cancel()
+                _vllm_monitor_task = None
+            logger.info("vLLM server stopped")
 
-# --- Auto-Restart Watchdog ---
-async def auto_restart_watchdog():
-    global last_activity
-    while True:
-        await asyncio.sleep(60)  # check every 1 min
-        now = time.time()
-        active = len([t for t in tasks.values() if t["status"] == "processing"])
-        if active == 0 and (now - last_activity) > 1800:  # 30 minutes idle
-            logger.info("Idle for 30 min, restarting server...")
-            os._exit(0)  # clean exit, wrapper relaunches
-
-# --- OCR Processing ---
+# --- OCR Processing (unchanged logic, only minor robustness additions) ---
 async def process_page(pdf_path: str, page_num: int) -> Dict[str, Any]:
     import httpx, base64
     from io import BytesIO
     from PIL import Image
+
     MAX_TOKENS = 4500
     TEMPERATURES = [0.1,0.1,0.2,0.3,0.5,0.8,0.9,1.0]
     attempt, cumulative_rotation = 0, 0
@@ -249,27 +295,31 @@ async def process_page(pdf_path: str, page_num: int) -> Dict[str, Any]:
 
     try:
         fb_text = get_anchor_text(pdf_path, page_num, pdf_engine="pdftotext")
-    except:
+    except Exception:
         fb_text = ""
     return {"text": fb_text, "tokens": {"input":0,"output":0}, "success": False}
 
 async def process_pdf(pdf_path: str, filename: str) -> Dict[str, Any]:
     reader = PdfReader(pdf_path)
     num_pages = len(reader.pages)
+
     sem = asyncio.Semaphore(4)
-    async def worker(i): 
-        async with sem: 
+    async def worker(i):
+        async with sem:
             return await process_page(pdf_path, i)
 
     logger.info(f"Processing {num_pages} pages from {filename}")
     results = await asyncio.gather(*[worker(i) for i in range(1, num_pages + 1)])
+
     text = "\n".join(r["text"] for r in results if r.get("text"))
     total_in = sum(r["tokens"]["input"] for r in results)
     total_out = sum(r["tokens"]["output"] for r in results)
     failed = sum(1 for r in results if not r["success"])
+
     error_rate = failed/num_pages if num_pages else 0
     if error_rate > config.max_page_error_rate:
         raise ValueError(f"Too many failed pages: {failed}/{num_pages}")
+
     return {
         "text": text,
         "metadata": {"filename": filename, "model_used": config.model},
@@ -280,16 +330,20 @@ async def process_pdf(pdf_path: str, filename: str) -> Dict[str, Any]:
         "total_output_tokens": total_out,
     }
 
-# --- Background Task ---
+# --- Background Task: OCR Runner ---
 async def run_ocr_task(task_id: str, file_content: bytes, filename: str):
-    global last_activity
     start = time.time()
-    while not vllm_ready: 
+
+    # Wait for vLLM to be ready
+    while not vllm_ready:
         await asyncio.sleep(1)
+
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         try:
             tmp.write(file_content)
             tmp.flush()
+
+            # Handle image files by converting to PDF
             if is_png(tmp.name) or is_jpeg(tmp.name):
                 logger.info(f"Converting image {filename} to PDF")
                 pdf_bytes = convert_image_to_pdf_bytes(tmp.name)
@@ -297,45 +351,121 @@ async def run_ocr_task(task_id: str, file_content: bytes, filename: str):
                 tmp.truncate()
                 tmp.write(pdf_bytes)
                 tmp.flush()
+
+            # Process PDF with timeout
             try:
                 result = await asyncio.wait_for(
-                    process_pdf(tmp.name, filename), 
+                    process_pdf(tmp.name, filename),
                     timeout=config.task_timeout
                 )
                 result["processing_time"] = time.time() - start
                 tasks[task_id]["status"] = "complete"
                 tasks[task_id]["result"] = result
-                last_activity = time.time()  # update activity
                 logger.info(f"Task {task_id} completed successfully in {result['processing_time']:.1f}s")
             except asyncio.TimeoutError:
                 elapsed = time.time() - start
-                error_msg = f"Task timed out after {elapsed:.1f}s"
+                error_msg = f"Task timed out after {elapsed:.1f}s (max: {config.task_timeout}s)"
+                logger.error(f"Task {task_id} timed out: {error_msg}")
                 tasks[task_id]["status"] = "failed"
-                tasks[task_id]["result"] = {"error": error_msg, "timeout": True, "processing_time": elapsed}
+                tasks[task_id]["result"] = {
+                    "error": error_msg,
+                    "timeout": True,
+                    "processing_time": elapsed
+                }
+
         except Exception as e:
             elapsed = time.time() - start
+            logger.exception(f"Task {task_id} failed: {str(e)}")
             tasks[task_id]["status"] = "failed"
-            tasks[task_id]["result"] = {"error": str(e), "timeout": False, "processing_time": elapsed}
+            tasks[task_id]["result"] = {
+                "error": str(e),
+                "timeout": False,
+                "processing_time": elapsed
+            }
         finally:
-            if os.path.exists(tmp.name): 
+            if os.path.exists(tmp.name):
                 os.unlink(tmp.name)
 
-# --- FastAPI App ---
+# --- Lifespan (startup/shutdown) and auto-restart/watchdog ---
+async def auto_restart_task():
+    """Sleep for auto_restart_interval and then stop vLLM and exit process.
+    The external wrapper (run_server.sh or systemd) will respawn the process."""
+    interval = config.auto_restart_interval
+    # allow disabling via env var if you want
+    if os.environ.get("DISABLE_AUTO_RESTART", "0") == "1":
+        logger.info("Auto restart disabled via DISABLE_AUTO_RESTART=1")
+        return
+
+    while True:
+        logger.info(f"Auto-restart scheduler sleeping for {interval}s")
+        await asyncio.sleep(interval)
+        logger.warning("Auto-restart interval reached: stopping vLLM and exiting process to force restart.")
+        try:
+            await stop_vllm_server()
+        except Exception:
+            logger.exception("Error while stopping vLLM during auto-restart.")
+        # exit process so wrapper restarts it
+        os.kill(os.getpid(), signal.SIGTERM)
+        # If kill fails for some reason, fall back to os._exit
+        os._exit(0)
+
+async def vllm_watchdog_task():
+    """Monitor the vLLM HTTP endpoint; if it becomes unresponsive for a while, restart it."""
+    import httpx
+    consecutive_failures = 0
+    while True:
+        await asyncio.sleep(config.watchdog_check_interval)
+        # don't run watchdog while we are not running a vllm process
+        if not vllm_process:
+            consecutive_failures = 0
+            continue
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.get(f"http://localhost:{config.vllm_port}/v1/models")
+            if r.status_code == 200:
+                if consecutive_failures:
+                    logger.info("vLLM responded again. resetting watchdog failure counter.")
+                consecutive_failures = 0
+                continue
+            else:
+                consecutive_failures += 1
+                logger.warning(f"vLLM watchdog: non-200 ({r.status_code}). failures={consecutive_failures}")
+        except Exception as e:
+            consecutive_failures += 1
+            logger.warning(f"vLLM watchdog connection error: {e}. failures={consecutive_failures}")
+
+        if consecutive_failures >= config.watchdog_failure_threshold:
+            logger.error("vLLM appears unresponsive. performing restart of vLLM now.")
+            try:
+                await stop_vllm_server()
+            except Exception:
+                logger.exception("Error stopping vLLM from watchdog")
+            try:
+                await start_vllm_server()
+            except Exception:
+                logger.exception("Failed to restart vLLM from watchdog")
+            consecutive_failures = 0
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting OlmOCR API Server...")
     try:
         await start_vllm_server()
-        asyncio.create_task(auto_restart_watchdog())
+        # start auto restart and watchdog tasks in background
+        asyncio.create_task(auto_restart_task())
+        asyncio.create_task(vllm_watchdog_task())
         logger.info("OlmOCR API Server startup completed successfully")
     except Exception as e:
-        logger.error(f"Failed to start OlmOCR API Server: {e}")
+        logger.exception(f"Failed to start OlmOCR API Server: {e}")
         raise
+
     yield
+
     logger.info("Shutting down OlmOCR API Server...")
     await stop_vllm_server()
     logger.info("OlmOCR API Server shutdown completed")
 
+# --- FastAPI App ---
 app = FastAPI(
     title="OlmOCR API Server",
     description="API for OCR processing using OlmOCR model",
@@ -345,28 +475,39 @@ app = FastAPI(
 
 @app.post("/submit", response_model=SubmitResponse)
 async def submit_ocr_task(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """Submit a PDF or image file for OCR processing"""
     if not vllm_ready:
-        raise HTTPException(status_code=503, detail="Server is still starting up")
+        raise HTTPException(status_code=503, detail="Server is still starting up, please try again later")
+
     task_id = str(uuid.uuid4())
     tasks[task_id] = {"status": "processing", "result": {}}
     content = await file.read()
+
+    logger.info(f"Submitted task {task_id} for file: {file.filename}")
     background_tasks.add_task(run_ocr_task, task_id, content, file.filename)
     return {"task_id": task_id}
 
 @app.get("/status/{task_id}", response_model=StatusResponse)
 async def get_task_status(task_id: str):
+    """Get the status of a submitted OCR task"""
     task = tasks.get(task_id)
-    if not task: 
+    if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return task
 
 @app.get("/health")
 async def health_check():
+    """Health check endpoint"""
     status = "healthy" if vllm_ready else "starting"
-    return {"status": status, "vllm_ready": vllm_ready, "active_tasks": len([t for t in tasks.values() if t["status"] == "processing"])}
+    return {
+        "status": status,
+        "vllm_ready": vllm_ready,
+        "active_tasks": len([t for t in tasks.values() if t["status"] == "processing"])
+    }
 
 @app.get("/tasks")
 async def list_tasks():
+    """List all tasks and their statuses"""
     return {
         "total_tasks": len(tasks),
         "processing": len([t for t in tasks.values() if t["status"] == "processing"]),
@@ -378,9 +519,10 @@ async def list_tasks():
 # --- Main ---
 if __name__ == "__main__":
     uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=8000, 
+        "server:app",  # module:app so uvicorn can reload gracefully
+        host="0.0.0.0",
+        port=8000,
         timeout_keep_alive=1000,
-        log_level="info"
+        log_level="info",
+        access_log=False
     )
